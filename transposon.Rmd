@@ -1,0 +1,283 @@
+---
+title: "Identifying transposon insertion sites from raw reads in base R"
+output: html_document
+date: '2022-06-23'
+author: Yiqiao Sun
+---
+
+# Introduction
+Transposon mutagenesis is widely used for determining gene functions in molecular biology. Traditionally, after mutagenesis, laborious 2-step PCR processes (like nested PCR) are used for identifying which gene has been inserted in the mutated phenotype. 
+This script takes in fastq sequencing file and transposon sequences and returns a list of reads that have been inserted by transposons, with transposon cut off. Users can then map these reads to the target genome and view it. Blast is also worth trying. Local alignment algoritm is used to search for insertion pattern. It is done without mapping raw reads to the genome. 
+All the functions are written in base R, so no additional packages are needed. 
+It is recommended to use Rsubread to do the mapping.
+
+## functions for 1st filtering based on transposon motif (5'end or 3'end several bp)
+functions used in this script. Functions include local alignment etc. 
+```{r}
+# fastqname: char, name of the cleaned fastq file
+# tseqs: char, name of the file containing transposon sequences, in fasta format
+# this function return a dataframe, 1st column the names of the reads with transposon insertion, 
+# 2nd column with corresponding sequences
+# library(dplyr)
+# use first and last blength (barcode length) of the transposon sequence for rough detection
+# for raw reads
+
+# write fasta file in current dir, string, vector, vector
+write_fasta <- function(base_name,ids,seqs){
+  out <- file(base_name, open = "w")
+  if(length(ids)!=length(seqs)) stop("Wrong dimension in seqs and ids")
+  for(i in 1:length(ids)){
+    writeLines(sub("@",">",ids[i]),out)
+    writeLines(seqs[i],out)
+  }
+  close(out)
+}
+
+get_trans_barcodes <- function(tseq,blength){
+  return(list(
+    substr(tseq,1,blength),
+    substr(tseq,nchar(tseq)-blength + 1, nchar(tseq))
+  ))
+}
+# detect whether head or tail is in the read
+if_head_tail_in <- function(read, tseq, blength){
+  barcodes <- get_trans_barcodes(tseq,blength)
+  if(grepl(barcodes[[1]],read)) return(1)
+  if(grepl(barcodes[[2]],read)) return(2)
+  return(0)
+}
+# export sequences with certain signal of insertion
+# signal is defined as first or last blength of transposons 
+# present in the reads, and these reads are extracted
+get_seqs_tagged <- function(fastq_name, transposon_name, blength){
+  if ((!file.exists(fastq_name))||(!file.exists(transposon_name))) stop("Can't find input file")
+  con <- file(transposon_name, open = "r")
+  tseq <- readLines(con,2)[2]
+  tseq <- paste(substr(tseq,1,150),substr(tseq,nchar(tseq)-150 + 1,nchar(tseq)),sep = "")
+  close(con)
+  con <- file(fastq_name, open = "r")
+  seqnames <- c()
+  seqs <- c()
+  repeat{
+    temp_seq <- readLines(con,4)
+    if(length(temp_seq) < 1)break
+    if(if_head_tail_in(temp_seq[2],tseq,blength)){
+      seqnames <- c(seqnames,temp_seq[1])
+      seqs <- c(seqs, temp_seq[2])
+    }
+  }
+  close(con)
+  return(list(seqnames, seqs))
+}
+
+# alignment functions 
+
+```
+
+## Local alingment functions
+```{r}
+
+# In all functions the following parameters are the same:
+# seqA: the first sequence to align
+# seqB: the second sequence to align
+# score_gap: score for a gap
+# score_match: score for a character match
+# score_mismatch: score for a character mismatch
+# local: (logical) True if alignment is local, False otherwise
+
+init_score_matrix = function(nrow, ncol, local, score_gap) {
+    score_matrix <- matrix(0,nrow,ncol)
+    if(local==F) {
+      score_matrix[1,] <- seq(0,score_gap*ncol,score_gap)[1:ncol]
+      score_matrix[,1] <- seq(0,score_gap*nrow,score_gap)[1:nrow]
+    }
+
+    return(score_matrix)
+}
+
+init_path_matrix = function(nrow, ncol, local) {
+    path_matrix <- matrix("",nrow,ncol)
+    if(local==F){
+      path_matrix[1,] <- rep("left",ncol)
+      path_matrix[,1] <- rep("up",nrow)
+    }
+    return(path_matrix)
+}
+
+get_best_score_and_path = function(row, col, nucA, nucB, score_matrix, score_gap, score_match, score_mismatch, local) {
+    scores <- c(score_matrix[row-1,col-1]+ifelse(nucA==nucB,score_match,score_mismatch),
+        score_matrix[row-1,col]+score_gap,
+        score_matrix[row,col-1]+score_gap)
+    paths <- c("diag", "up", "left")
+    if(local){
+      score <- max(scores,0)
+      path <- ifelse(score <= 0,"-",paths[which.max(scores)])
+    }else{
+      score <- max(scores)
+      path <- paths[which.max(scores)]
+    }
+    return(list("score"=score, "path"=path))
+}
+
+fill_matrices = function(seqA, seqB, score_gap, score_match, score_mismatch, local, score_matrix, path_matrix) {
+    for ( i in c(2:(nchar(seqA)+1))){
+      for ( j in c(2:(nchar(seqB)+1))){
+        res <- get_best_score_and_path(row = i,col = j,nucA = substr(seqA,i-1,i-1),nucB = substr(seqB,j-1,j-1),
+                                       score_matrix= score_matrix,score_gap = score_gap,
+                                       score_match = score_match,score_mismatch = score_mismatch,
+                                       local = local)
+        score_matrix[i,j] <- res[["score"]]
+        path_matrix[i,j] <- res[["path"]]
+      }
+    }
+
+    return(list("score_matrix"=score_matrix, "path_matrix"=path_matrix))
+}
+
+get_best_move = function(nucA, nucB, path, row, col) {
+    newrow = row-1
+    newcol = col-1
+    char1 = nucA
+    char2 = nucB
+    if(path == "up"){ #gap in seqB
+      newcol = col
+      char2 = '-'
+    }
+    if(path == "left"){ #gap in seqA
+      newrow = row
+      char1 = '-'
+    }
+    return(list("newrow"=newrow, "newcol"=newcol, "char1"=char1, "char2"=char2))
+}
+
+get_best_alignment = function(seqA, seqB, score_matrix, path_matrix, local) {
+    if(local){
+      score <-  max(score_matrix)
+      loc <- which(score_matrix==max(score_matrix),arr.ind=T)
+      pa <- loc[1,1]
+      pb <- loc[1,2]
+      alignment <- c("","")
+      while(score_matrix[pa,pb]>0){
+        res = get_best_move(nucA = substr(seqA,pa-1,pa-1),nucB = substr(seqB,pb-1,pb-1),path = path_matrix[pa,pb],
+                            row = pa,col = pb)
+        pa = res[["newrow"]]
+        pb = res[["newcol"]]
+        alignment[1] = paste0(res[["char1"]],alignment[1])
+        alignment[2] = paste0(res[["char2"]],alignment[2])
+      }
+    }else{
+      score <-  score_matrix[nrow(score_matrix),ncol(score_matrix)]
+      pa <- nrow(score_matrix)
+      pb <- ncol(score_matrix)
+      alignment <- c("","")
+      while(pa > 1 | pb > 1){
+        res = get_best_move(nucA = substr(seqA,pa-1,pa-1),nucB = substr(seqB,pb-1,pb-1),path = path_matrix[pa,pb],
+                            row = pa,col = pb)
+        pa = res[["newrow"]]
+        pb = res[["newcol"]]
+        alignment[1] = paste0(res[["char1"]],alignment[1])
+        alignment[2] = paste0(res[["char2"]],alignment[2])
+      }
+    }
+    length_nogap <- nchar(gsub("-","",alignment[1]))
+    pos_seqA <- as.numeric(c(loc[1,1]-length_nogap,loc[1,1]-1))
+    return(list("score"=score, "alignment"=alignment, "position_seqA"=pos_seqA))
+}
+
+align = function(seqA, seqB, score_gap, score_match, score_mismatch, local) {
+  
+    path_matrix = init_path_matrix(nchar(seqA)+1,nchar(seqB)+1,local)
+    score_matrix = init_score_matrix(nchar(seqA)+1,nchar(seqB)+1,local,score_gap)
+  
+    # Fill in the matrices with scores and paths using dynamic programming
+    filled =fill_matrices(seqA,seqB,score_gap,score_match,score_mismatch,local,score_matrix,path_matrix)
+    score_matrix=filled[["score_matrix"]]
+    path_matrix=filled[["path_matrix"]]
+    # Get the best score and alignment (or one thereof if there are multiple with equal score)
+    result = get_best_alignment(seqA,seqB,score_matrix,path_matrix,local)
+    
+    # Return the best score and alignment (or one thereof if there are multiple with equal score)
+    # Returns the same value types as get_best_alignment
+    return(result)
+}
+
+```
+
+## Functions that cut reads based on alignment 
+This function aims to return reads with transposon sequences inserted.
+
+reads are considered as inserted based on criterium: 
+1. aligned region larger than 20 bp, with alignment parameters
+   score_gap(-2), score_match(+1) and score_mismatch(-1).
+2. aligned score > 20
+Note: Reason for this step is that not all reads with detected tag (first/last 10bp of transposon sequence)
+are considered as inserted by transposon. Some are False posotive. 
+
+```{r}
+# return list of inserted reads, transposon cut off, and their ids
+filter_inserted_seqs <- function(fastq_name, transposon_name, blength, out_name, read_length=20){
+  # get tagged reads
+  tagged_seqs <- get_seqs_tagged(fastq_name, transposon_name, blength)
+  # get the transposon sequence
+  con <- file(transposon_name, open = "r")
+  trans_seq <- readLines(con,2)[2]
+  trans_seq <- paste(substr(trans_seq,1,150),substr(trans_seq,nchar(trans_seq)-150 + 1,nchar(trans_seq)),sep = "")
+  close(con)
+  barcodes <- get_trans_barcodes(trans_seq,blength)
+  num_seqs <- length(tagged_seqs[[1]])
+  inserted_ids <- c()
+  inserted_seqs <- c()
+  for(i in 1:num_seqs){
+    alignment_result <- align(tagged_seqs[[2]][i],trans_seq,-2,1,-1,local =  TRUE)
+    alignment_start <- alignment_result[[3]][1]
+    alignment_end <- alignment_result[[3]][2]
+    alignment_length <- alignment_end - alignment_start
+    alignment_score <- alignment_result[[1]]
+    
+    if(alignment_length > 20 && alignment_score > 20){
+      
+      if(grepl(barcodes[[1]],tagged_seqs[[2]][i])){
+        inserted_ids <- c(inserted_ids,tagged_seqs[[1]][i]) # add id
+        inserted_seqs <- c(inserted_seqs,substr(tagged_seqs[[2]][i],1,alignment_start-1)) # add sequence
+      }else if(grepl(barcodes[[2]],tagged_seqs[[2]][i])){
+        inserted_ids <- c(inserted_ids,tagged_seqs[[1]][i]) # add id 
+        inserted_seqs <- c(inserted_seqs,substr(tagged_seqs[[2]][i],alignment_end+1,nchar(tagged_seqs[[2]][i]))) # add sequence
+      }
+      
+    }
+  }
+  index_length <- nchar(inserted_seqs) > read_length
+  inserted_ids <- inserted_ids[index_length]
+  inserted_seqs <- inserted_seqs[index_length]
+  write_fasta(out_name,inserted_ids,inserted_seqs)
+  return(list(inserted_ids,
+              inserted_seqs))
+}
+
+```
+
+## Run filter
+Input:
+fastq file, 
+transposon sequence (single line), 
+define barcode length you wish to use in the 1st filter, a
+nd specify the output file name. 
+```{r}
+test_filter <- filter_inserted_seqs("sample_data_ITIS/sample.fq1","sample_data_ITIS/mping_single.fa",10,"reads_inserted_transposon_cut.fa")
+
+# View read length after cut
+hist(nchar(test_filter[[2]]))
+head(test_filter[[2]])
+
+# A fasta file is generated in the current path, which can be used in downstream analysis.
+
+```
+
+## Blast against genome file
+```{r}
+# functions of Blast or mapping, not written yet.
+# users can use currently available packages for mapping.
+```
+
+
+
